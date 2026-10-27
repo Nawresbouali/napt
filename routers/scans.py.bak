@@ -1,0 +1,371 @@
+import uuid, asyncio, json
+from datetime import datetime
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from sqlalchemy.orm import Session
+from database import get_db
+from models import Scan, AuditLog, Notification, RemediationLog, ChatMessage
+from schemas import LaunchScanRequest, ScanOut, UpdateRemediation, ChatRequest
+from auth import get_current_user, decode_token
+
+router = APIRouter(prefix="/api/scans", tags=["scans"])
+
+def log(db, event, actor, detail=None, success=True):
+    db.add(AuditLog(event_type=event, actor_username=actor, detail=detail, success=success))
+    db.commit()
+
+# Active WebSocket connections {scan_id: [ws, ...]}
+_ws_connections: dict = {}
+
+# Events per scan stored as list (thread-safe via GIL for list.append)
+_scan_events: dict = {}
+
+def emit_event(scan_id: str, event_type: str, agent: str = None, data: dict = None, output: str = None):
+    """Append an event to the scan's event list (callable from threads)."""
+    event = {
+        "type": event_type,
+        "agent": agent,
+        "data": data or {},
+        "output": output,
+        "ts": datetime.utcnow().isoformat()
+    }
+    if scan_id not in _scan_events:
+        _scan_events[scan_id] = []
+    _scan_events[scan_id].append(event)
+
+
+@router.get("", response_model=list[ScanOut])
+def list_scans(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    if user.role == "admin":
+        return db.query(Scan).order_by(Scan.started_at.desc()).all()
+    return db.query(Scan).filter(Scan.started_by_id == user.id).order_by(Scan.started_at.desc()).all()
+
+@router.post("")
+def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    scan_id = str(uuid.uuid4())
+    scan = Scan(id=scan_id, target=data.target, target_type=data.target_type,
+                status="running", started_by_id=user.id)
+    db.add(scan); db.commit()
+    log(db, "scan_launched", user.username, f"Target: {data.target}")
+    db.add(Notification(user_id=user.id, title="Scan lance",
+        message=f"Scan de {data.target} en cours...", type="info", scan_id=scan_id))
+    db.commit()
+
+    # Initialize event list
+    _scan_events[scan_id] = []
+
+    import threading
+    def run_scan(sid, target):
+        import subprocess, re, sys
+
+        # Normalize target
+        if target.startswith("http://") or target.startswith("https://"):
+            from urllib.parse import urlparse
+            parsed = urlparse(target)
+            host = parsed.hostname or target
+            port = parsed.port
+        else:
+            parts = target.split(":")
+            host = parts[0]
+            port = int(parts[1]) if len(parts) > 1 else None
+
+        from database import SessionLocal
+        sys.path.insert(0, "/home/motez/napt_api/rag")
+        db2 = SessionLocal()
+
+        try:
+            # ─── AGENT 1: RECONNAISSANCE ───────────────────────────────────
+            emit_event(sid, "agent_start", "reconnaissance", {
+                "label": "Reconnaissance",
+                "target": host,
+                "port": port
+            })
+
+            nmap_cmd = ["nmap", "-sV", "-p", str(port) if port else "top50",
+                        "--host-timeout", "60s", host]
+            if not port:
+                nmap_cmd = ["nmap", "-sV", "--top-ports", "50", "--host-timeout", "60s", host]
+
+            emit_event(sid, "agent_output", "reconnaissance",
+                       output=f"[NAPT_0]$ {' '.join(nmap_cmd)}")
+
+            proc = subprocess.Popen(nmap_cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+
+            nmap_output_lines = []
+            for line in proc.stdout:
+                line = line.rstrip()
+                nmap_output_lines.append(line)
+                emit_event(sid, "agent_output", "reconnaissance", output=line)
+
+            proc.wait()
+            full_output = "\n".join(nmap_output_lines)
+
+            # Parse ports
+            ports = []
+            for line in nmap_output_lines:
+                m = re.match(r"\s*(\d+)/(\w+)\s+open\s+(\S+)\s*(.*)", line)
+                if m:
+                    ports.append({
+                        "port": m.group(1),
+                        "proto": m.group(2),
+                        "service": m.group(3),
+                        "version": m.group(4).strip()
+                    })
+
+            # Extract host info
+            latency = None
+            for line in nmap_output_lines:
+                lm = re.search(r"\((\d+\.\d+s) latency\)", line)
+                if lm:
+                    latency = lm.group(1)
+
+            emit_event(sid, "agent_result", "reconnaissance", {
+                "host": host,
+                "latency": latency,
+                "ports": ports,
+                "ports_count": len(ports)
+            })
+            emit_event(sid, "agent_complete", "reconnaissance")
+
+            # ─── AGENT 2: RAG LOOKUP ──────────────────────────────────────
+            emit_event(sid, "agent_start", "rag_lookup", {"label": "RAG Lookup"})
+
+            cve_id, severity, cvss, summary = None, "low", "0.0", None
+
+            if ports:
+                from searcher import find_cve_for_service
+                best_score = -1
+                best_svc = None
+                for svc in ports:
+                    query_str = f"{svc['service']} {svc['version']}"
+                    emit_event(sid, "agent_output", "rag_lookup",
+                               output=f"+ rag_query: {query_str}")
+
+                    cves = find_cve_for_service(svc["service"], svc["version"], limit=1)
+                    if cves:
+                        c = cves[0]
+                        c_cvss = float(c.get("cvss") or c.get("cvss_score") or 0)
+                        if c_cvss > best_score:
+                            best_score = c_cvss
+                            cve_id = c.get("cve_id")
+                            severity = c.get("severity", "low")
+                            cvss = str(c_cvss)
+                            summary = c.get("text", "")
+                            best_svc = svc
+
+                if cve_id:
+                    from searcher import get_remediation
+                    reco = get_remediation(cve_id)
+                    remediation_text = reco
+                    if summary:
+                        summary = summary + " || REMEDIATION: " + reco
+
+                    emit_event(sid, "agent_result", "rag_lookup", {
+                        "cve_id": cve_id,
+                        "cvss": cvss,
+                        "severity": severity,
+                        "service": best_svc["service"] if best_svc else "",
+                        "version": best_svc["version"] if best_svc else "",
+                        "query": f"{best_svc['service']} {best_svc['version']}" if best_svc else ""
+                    })
+                    emit_event(sid, "agent_output", "rag_lookup",
+                               output=f"✓ CVE trouvée: {cve_id} (CVSS: {cvss})")
+                else:
+                    emit_event(sid, "agent_output", "rag_lookup",
+                               output="✗ Aucune CVE trouvée dans la base")
+
+            emit_event(sid, "agent_complete", "rag_lookup")
+
+            # ─── AGENT 3: REPORT ──────────────────────────────────────────
+            emit_event(sid, "agent_start", "report", {"label": "Report"})
+            emit_event(sid, "agent_output", "report", output="+ create_vulnerability_report")
+            if cve_id:
+                emit_event(sid, "agent_output", "report",
+                           output=f"+ Severity: {severity.upper()}  CVSS: {cvss}")
+            emit_event(sid, "agent_output", "report", output="+ finish_scan")
+
+            # Save to DB
+            s = db2.query(Scan).filter(Scan.id == sid).first()
+            if s:
+                s.status = "completed"
+                s.finished_at = datetime.utcnow()
+                s.cve_id = cve_id
+                s.severity = severity
+                s.cvss_score = cvss
+                s.client_summary = summary
+                s.raw_output = full_output
+                db2.commit()
+
+            emit_event(sid, "agent_complete", "report")
+            emit_event(sid, "scan_complete", data={
+                "cve_id": cve_id,
+                "severity": severity,
+                "cvss": cvss
+            })
+
+        except Exception as e:
+            emit_event(sid, "agent_error", data={"message": str(e)})
+            s = db2.query(Scan).filter(Scan.id == sid).first()
+            if s:
+                s.status = "failed"
+                s.raw_output = str(e)
+                db2.commit()
+        finally:
+            db2.close()
+
+    threading.Thread(target=run_scan, args=(scan_id, data.target), daemon=True).start()
+    return {"id": scan_id, "target": data.target, "status": "running",
+            "started_at": scan.started_at.isoformat()}
+
+
+@router.post("/{scan_id}/stop")
+def stop_scan(scan_id: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(404, "Scan introuvable")
+    scan.status = "stopped"
+    scan.finished_at = datetime.utcnow()
+    db.commit()
+    log(db, "scan_stopped", user.username, f"{scan.target} - manually stopped")
+    emit_event(scan_id, "stopped")
+    return {"success": True}
+
+
+@router.get("/nmap-network")
+def scan_network(user=Depends(get_current_user)):
+    import subprocess, re
+    try:
+        result = subprocess.run(
+            ["nmap", "-sn", "172.22.64.0/20", "--host-timeout", "10s"],
+            capture_output=True, text=True, timeout=60
+        )
+        output = result.stdout
+        hosts = []
+        for line in output.splitlines():
+            ip_match = re.search(r"Nmap scan report for (.+)", line)
+            if ip_match:
+                hosts.append({"host": ip_match.group(1), "status": "up"})
+        return {"network": "172.22.64.0/20", "hosts_found": len(hosts), "hosts": hosts, "raw": output}
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="Scan timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/nmap-target")
+def scan_target(host: str, user=Depends(get_current_user)):
+    import subprocess, re
+    if not re.match(r'^[\w\.\-]+$', host):
+        raise HTTPException(status_code=400, detail="Cible invalide")
+    try:
+        result = subprocess.run(
+            ["nmap", "-sV", "--top-ports", "100", "--host-timeout", "30s", host],
+            capture_output=True, text=True, timeout=120
+        )
+        output = result.stdout
+        ports = []
+        for line in output.splitlines():
+            m = re.match(r'\s*(\d+/\w+)\s+(\w+)\s+(\S+)\s*(.*)', line)
+            if m:
+                ports.append({"port": m.group(1), "state": m.group(2),
+                              "service": m.group(3), "version": m.group(4).strip()})
+        return {"target": host, "ports": ports, "raw": output}
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="Scan timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{scan_id}", response_model=ScanOut)
+def get_scan(scan_id: str, db: Session = Depends(get_db), _=Depends(get_current_user)):
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(404, "Scan introuvable")
+    return scan
+
+
+@router.patch("/{scan_id}/remediation")
+def update_remediation(scan_id: str, data: UpdateRemediation,
+                       db: Session = Depends(get_db), user=Depends(get_current_user)):
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(404, "Scan introuvable")
+    old = scan.remediation_status
+    scan.remediation_status = data.status
+    db.commit()
+    db.add(RemediationLog(scan_id=scan_id, old_status=old,
+        new_status=data.status, changed_by=user.username, note=data.note))
+    db.commit()
+    log(db, "remediation_status_changed", user.username,
+        f"Scan {scan.target} ({scan.cve_id or '?'}): {old} -> {data.status}")
+    return {"success": True}
+
+
+@router.post("/{scan_id}/chat")
+def chat(scan_id: str, data: ChatRequest,
+         db: Session = Depends(get_db), user=Depends(get_current_user)):
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(404)
+    db.add(ChatMessage(scan_id=scan_id, role="user", content=data.message))
+    db.commit()
+    reply = generate_reply(data.message, scan)
+    db.add(ChatMessage(scan_id=scan_id, role="assistant", content=reply))
+    db.commit()
+    return {"reply": reply}
+
+
+def generate_reply(question: str, scan) -> str:
+    try:
+        import requests as req
+        payload = {
+            "model": "mistral",
+            "prompt": f"Tu es un expert en securite. Scan: {scan.target}, CVE: {scan.cve_id}, Privilege: {scan.privilege}.\nQuestion: {question}",
+            "stream": False
+        }
+        r = req.post("http://localhost:11434/api/generate", json=payload, timeout=30)
+        return r.json().get("response", "")
+    except Exception:
+        return (f"Concernant {scan.cve_id or 'cette vulnerabilite'} sur {scan.target}: "
+                f"Appliquer les patches de securite et verifier les configurations systeme. "
+                f"Statut remediation actuel : {scan.remediation_status}.")
+
+
+# ── WebSocket live scan ─────────────────────────────────────────────────────
+@router.websocket("/{scan_id}/live")
+async def ws_live(websocket: WebSocket, scan_id: str):
+    token = websocket.query_params.get("token", "")
+    payload = decode_token(token)
+    if not payload.get("sub"):
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    if scan_id not in _ws_connections:
+        _ws_connections[scan_id] = []
+    _ws_connections[scan_id].append(websocket)
+
+    sent_index = 0
+    try:
+        while True:
+            events = _scan_events.get(scan_id, [])
+            # Send all new events
+            while sent_index < len(events):
+                await websocket.send_text(json.dumps(events[sent_index]))
+                sent_index += 1
+
+            # Check if scan is finished (no more events will come)
+            last_types = [e["type"] for e in events[-3:]] if events else []
+            if any(t in last_types for t in ["scan_complete", "scan_failed", "stopped"]):
+                break
+
+            await asyncio.sleep(0.3)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if scan_id in _ws_connections and websocket in _ws_connections[scan_id]:
+            _ws_connections[scan_id].remove(websocket)
