@@ -2,19 +2,27 @@
 set -e
 echo "=== N.A.P.T Installation ==="
 
-# Backend
+# 1. System dependencies
+echo "[1/6] Installing system dependencies..."
+sudo apt-get update -qq
+sudo apt-get install -y python3 python3-venv python3-pip nodejs npm nmap wget curl
+
+# 2. Backend
+echo "[2/6] Setting up backend..."
 cd $(dirname $0)
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -q -r requirements.txt
 
-# .env
+# 3. .env
+echo "[3/6] Configuring environment..."
 if [ ! -f .env ]; then
   echo "OPENROUTER_API_KEY=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" > .env
   echo "SECRET_KEY=napt_secret_key" >> .env
 fi
 
-# Qdrant
+# 4. Qdrant
+echo "[4/6] Installing Qdrant..."
 mkdir -p /tmp/qdrant
 if [ ! -f /tmp/qdrant/qdrant ]; then
   wget -q https://github.com/qdrant/qdrant/releases/download/v1.9.0/qdrant-x86_64-unknown-linux-musl.tar.gz -O /tmp/qdrant.tar.gz
@@ -23,14 +31,22 @@ fi
 /tmp/qdrant/qdrant --disable-telemetry &
 sleep 3
 
-# Index CVEs
+# 5. Index CVEs
+echo "[5/6] Indexing CVE database..."
 python3 index_cves.py
 
-# Frontend
-cd ../napt_frontend 2>/dev/null || git clone https://github.com/Nawresbouali/napt-frontend.git ../napt_frontend && cd ../napt_frontend
-npm install
+# 6. Frontend
+echo "[6/6] Setting up frontend..."
+SCRIPT_DIR=$(dirname $0)
+if [ ! -d "$SCRIPT_DIR/../napt_frontend" ]; then
+  git clone https://github.com/Nawresbouali/napt-frontend.git "$SCRIPT_DIR/../napt_frontend"
+fi
+cd "$SCRIPT_DIR/../napt_frontend"
+npm install -q
 npm run build
 
 echo ""
-echo "=== Installation terminee ==="
-echo "Pour lancer: bash start.sh"
+echo "=============================="
+echo "  Installation complete!"
+echo "  Run: bash start.sh"
+echo "=============================="
