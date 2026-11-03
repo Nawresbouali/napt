@@ -40,7 +40,7 @@ sleep 4
 # 5. Index CVEs
 echo "[5/6] Indexing CVE database..."
 cd "$SCRIPT_DIR"
-source "$SCRIPT_DIR/venv/bin/activate" && python3 index_cves.py
+"$SCRIPT_DIR/venv/bin/python3" index_cves.py
 
 # 6. Frontend
 echo "[6/6] Setting up frontend..."
