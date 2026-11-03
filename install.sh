@@ -5,11 +5,18 @@ echo "=== N.A.P.T Installation ==="
 # 1. System dependencies
 echo "[1/6] Installing system dependencies..."
 sudo apt-get update -qq
-sudo apt-get install -y python3 python3-venv python3-pip nodejs npm nmap wget curl
+sudo apt-get install -y python3 python3-venv python3-pip nmap wget curl git
+
+# Node.js via nodesource (evite conflit npm/nodejs)
+if ! command -v node &>/dev/null; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+  sudo apt-get install -y nodejs
+fi
 
 # 2. Backend
 echo "[2/6] Setting up backend..."
-cd $(dirname $0)
+SCRIPT_DIR=$(cd $(dirname $0) && pwd)
+cd "$SCRIPT_DIR"
 python3 -m venv venv
 source venv/bin/activate
 pip install -q -r requirements.txt
@@ -28,6 +35,7 @@ if [ ! -f /tmp/qdrant/qdrant ]; then
   wget -q https://github.com/qdrant/qdrant/releases/download/v1.9.0/qdrant-x86_64-unknown-linux-musl.tar.gz -O /tmp/qdrant.tar.gz
   tar -xzf /tmp/qdrant.tar.gz -C /tmp/qdrant
 fi
+pkill qdrant 2>/dev/null || true
 /tmp/qdrant/qdrant --disable-telemetry &
 sleep 3
 
@@ -37,12 +45,11 @@ python3 index_cves.py
 
 # 6. Frontend
 echo "[6/6] Setting up frontend..."
-SCRIPT_DIR=$(dirname $0)
 if [ ! -d "$SCRIPT_DIR/../napt_frontend" ]; then
   git clone https://github.com/Nawresbouali/napt-frontend.git "$SCRIPT_DIR/../napt_frontend"
 fi
 cd "$SCRIPT_DIR/../napt_frontend"
-npm install -q
+npm install --silent
 npm run build
 
 echo ""
