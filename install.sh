@@ -30,7 +30,7 @@ fi
 
 # 4. Qdrant
 echo "[4/6] Installing Qdrant..."
-mkdir -p /tmp/qdrant
+mkdir -p /tmp/qdrant 2>/dev/null; true
 if [ ! -f /tmp/qdrant/qdrant ]; then
   wget -q https://github.com/qdrant/qdrant/releases/download/v1.9.0/qdrant-x86_64-unknown-linux-musl.tar.gz -O /tmp/qdrant.tar.gz
   tar -xzf /tmp/qdrant.tar.gz -C /tmp/qdrant
