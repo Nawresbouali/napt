@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set +e
 echo "=== N.A.P.T Installation ==="
 
 # 1. System dependencies
