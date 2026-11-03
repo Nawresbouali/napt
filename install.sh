@@ -35,7 +35,7 @@ tar -xzf /tmp/qdrant.tar.gz -C /tmp/qdrant
 pkill qdrant 2>/dev/null || true
 sleep 1
 /tmp/qdrant/qdrant --disable-telemetry > /tmp/qdrant.log 2>&1 &
-sleep 4
+sleep 6
 
 # 5. Index CVEs
 echo "[5/6] Indexing CVE database..."
