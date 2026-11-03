@@ -1,21 +1,19 @@
 #!/bin/bash
-set +e
 echo "=== N.A.P.T Installation ==="
+
+SCRIPT_DIR=$(cd $(dirname $0) && pwd)
 
 # 1. System dependencies
 echo "[1/6] Installing system dependencies..."
 sudo apt-get update -qq
-sudo apt-get install -y python3 python3-venv python3-pip nmap wget curl git
-
-# Node.js via nodesource (evite conflit npm/nodejs)
+sudo apt-get install -y python3 python3-venv python3-pip nmap wget curl git 2>/dev/null || true
 if ! command -v node &>/dev/null; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-  sudo apt-get install -y nodejs
+  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - 2>/dev/null
+  sudo apt-get install -y nodejs 2>/dev/null || true
 fi
 
 # 2. Backend
 echo "[2/6] Setting up backend..."
-SCRIPT_DIR=$(cd $(dirname $0) && pwd)
 cd "$SCRIPT_DIR"
 python3 -m venv venv
 source venv/bin/activate
@@ -30,17 +28,18 @@ fi
 
 # 4. Qdrant
 echo "[4/6] Installing Qdrant..."
-mkdir -p /tmp/qdrant 2>/dev/null; true
-if [ ! -f /tmp/qdrant/qdrant ]; then
-  wget -q https://github.com/qdrant/qdrant/releases/download/v1.9.0/qdrant-x86_64-unknown-linux-musl.tar.gz -O /tmp/qdrant.tar.gz
-  tar -xzf /tmp/qdrant.tar.gz -C /tmp/qdrant
-fi
+rm -rf /tmp/qdrant
+mkdir -p /tmp/qdrant
+wget -q https://github.com/qdrant/qdrant/releases/download/v1.9.0/qdrant-x86_64-unknown-linux-musl.tar.gz -O /tmp/qdrant.tar.gz
+tar -xzf /tmp/qdrant.tar.gz -C /tmp/qdrant
 pkill qdrant 2>/dev/null || true
-/tmp/qdrant/qdrant --disable-telemetry &
-sleep 3
+sleep 1
+/tmp/qdrant/qdrant --disable-telemetry > /tmp/qdrant.log 2>&1 &
+sleep 4
 
 # 5. Index CVEs
 echo "[5/6] Indexing CVE database..."
+cd "$SCRIPT_DIR"
 python3 index_cves.py
 
 # 6. Frontend
@@ -55,5 +54,5 @@ npm run build
 echo ""
 echo "=============================="
 echo "  Installation complete!"
-echo "  Run: bash start.sh"
+echo "  Run: bash $SCRIPT_DIR/start.sh"
 echo "=============================="
