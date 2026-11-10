@@ -14,7 +14,8 @@ def get_client():
     global _client
     with _client_lock:
         if _client is None:
-            _client = QdrantClient("localhost", port=6333)
+            os.makedirs(DB_PATH, exist_ok=True)
+            _client = QdrantClient(path=DB_PATH)
         return _client
 
 def init_collection(recreate=False):
@@ -47,17 +48,18 @@ def upsert_batch(points, batch_size=100):
     return len(structs)
 
 def search(query_vector, limit=5, filter_cat=None):
+    from qdrant_client.models import QueryRequest
     client = get_client()
     qfilter = None
     if filter_cat:
         qfilter = Filter(must=[FieldCondition(key="category", match=MatchValue(value=filter_cat))])
-    results = client.search(
-        collection_name="cve_collection",
-        query_vector=query_vector,
+    results = client.query_points(
+        collection_name=COLLECTION,
+        query=query_vector,
         limit=limit,
         query_filter=qfilter,
         with_payload=True
-    )
+    ).points
     return [{"score": r.score, **r.payload} for r in results]
 
 def collection_stats():
@@ -70,18 +72,3 @@ def collection_stats():
         "distance": "Cosine",
         "model": "all-mpnet-base-v2"
     }
-
-
-def collection_stats():
-    try:
-        from qdrant_client import QdrantClient
-        client = QdrantClient("localhost", port=6333)
-        info = client.get_collection("cve_collection")
-        return {
-            "status": "ok",
-            "collection": "cve_collection",
-            "vectors_count": info.vectors_count,
-            "points_count": info.points_count
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}

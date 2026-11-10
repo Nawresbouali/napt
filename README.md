@@ -1,58 +1,75 @@
 # N.A.P.T — Nawres Autonomous Pentest Tool
 
-AI-powered autonomous penetration testing platform (PFE Cybersécurité).
+Plateforme web d'automatisation des tests d'intrusion assistée par intelligence
+artificielle. Un scan enchaîne automatiquement cinq agents : reconnaissance
+réseau (Nmap), recherche de vulnérabilités (RAG / Qdrant), évaluation du risque
+CVSS par le modèle Gemma, exploitation réelle (Metasploit) et génération du
+rapport.
 
-## Pipeline
+## Prérequis
 
-Nmap Scan → Qdrant RAG (CVE Search) → Gemma 4 AI Analysis → Exploit Suggestion → PDF Report
+- Linux (Ubuntu 22.04+ ou WSL2)
+- Accès `sudo` (pour installer les outils système)
+- Une clé API **OpenRouter** (gratuite sur https://openrouter.ai) pour le
+  modèle Gemma
+- **Docker** (optionnel) pour déployer des cibles vulnérables de test (Vulhub)
 
-## Stack
+Le script d'installation installe automatiquement : Python, Node.js, Nmap et
+Metasploit s'ils sont absents.
 
-- **Backend**: FastAPI + Python 3.10
-- **AI Model**: Google Gemma 4 via OpenRouter API
-- **RAG**: Qdrant v1.9.0 + fastembed (30 CVEs indexed)
-- **Frontend**: React 18 + Vite
-- **Auth**: JWT
+## Installation
 
-## Installation (automated)
+```bash
+git clone <repo-backend> napt_api_test
+git clone <repo-frontend> napt_frontend_test
+cd napt_api_test
+./install.sh
+```
 
-git clone https://github.com/Nawresbouali/napt.git
-cd napt
-bash install.sh
+Le script met en place l'environnement Python, les dépendances, l'index RAG et
+le frontend.
 
-This will automatically:
-- Create Python virtual environment
-- Install all dependencies
-- Download and start Qdrant
-- Index 30 critical CVEs (EternalBlue, Log4Shell, SMBGhost...)
-- Build the frontend
+## Configuration
 
-## Run
+Éditer le fichier `.env` (créé par le script) et renseigner la clé OpenRouter :
 
-bash start.sh
+```
+OPENROUTER_API_KEY=sk-or-v1-....
+JWT_SECRET=napt_secret_key
+DATABASE_URL=sqlite:///./napt.db
+```
 
-- Backend API: http://localhost:8000
-- Frontend UI: http://localhost:5173
-- API Docs: http://localhost:8000/docs
+## Lancement
 
-## Default credentials
+```bash
+./start.sh
+```
 
-Username: admin
-Password: admin123
+- Backend (API) : http://localhost:8000 — documentation sur `/docs`
+- Frontend : http://localhost:5173
 
-## Features
+Compte administrateur par défaut : **nawres / pfe2026**
 
-- Network Scan: Nmap integration (TCP/UDP/aggressive)
-- RAG CVE Search: Semantic search on CVE database
-- AI Analysis: Gemma 4 vulnerability analysis
-- Exploit Suggestion: AI-generated exploitation guidance
-- Dashboard: Real-time scan monitoring
-- PDF Report: Auto-generated audit report
+## Tester l'exploitation (environnement de test)
 
-## Requirements
+Déployer une cible vulnérable avec Docker / Vulhub, par exemple Samba
+(CVE-2017-7494) :
 
-- Linux (Ubuntu/Debian/WSL2)
-- Python 3.10+
-- Node.js 18+
-- Nmap (sudo apt install nmap)
-- OpenRouter API key (included in install)
+```bash
+cd vulhub/samba/CVE-2017-7494
+sudo docker-compose up -d
+```
+
+Puis lancer un scan sur `127.0.0.1` depuis l'interface.
+
+> Remarque : l'exploit SambaCry peut déstabiliser le service après plusieurs
+> tentatives. Recréer le conteneur (`docker-compose down && up -d`) avant chaque
+> démonstration.
+
+## Architecture
+
+- **Backend** : FastAPI (Python), authentification JWT, base SQLite/PostgreSQL
+- **IA** : Gemma 4 26B via l'API OpenRouter
+- **RAG** : Qdrant (base vectorielle) + fastembed (embeddings 768 dimensions)
+- **Exploitation** : Metasploit Framework
+- **Frontend** : React (Vite + Tailwind CSS)

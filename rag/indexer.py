@@ -3,6 +3,7 @@ from embedder import encode
 from store import init_collection, upsert_batch, collection_stats
 
 BUILTIN_CVE = [
+{"cve_id":"CVE-2017-7494","product":"Samba","description":"SambaCry remote code execution via writable Samba share, malicious shared library loaded by smbd. Affects Samba 3.5.0 to 4.6.4.","severity":"critical","cvss":"9.8","category":"remote"},
     {"cve_id":"CVE-2017-5638","product":"Apache Struts 2","description":"RCE via Content-Type header Jakarta Multipart parser.","severity":"critical","cvss":"10.0","category":"webapps"},
     {"cve_id":"CVE-2021-44228","product":"Apache Log4j 2","description":"Log4Shell JNDI injection leads to RCE. Affects Log4j 2.0-beta9 to 2.14.1.","severity":"critical","cvss":"10.0","category":"webapps"},
     {"cve_id":"CVE-2017-0144","product":"Windows SMB","description":"EternalBlue SMBv1 buffer overflow allows RCE. Used by WannaCry.","severity":"critical","cvss":"9.3","category":"dos"},

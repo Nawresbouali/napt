@@ -1,58 +1,54 @@
 #!/bin/bash
-echo "=== N.A.P.T Installation ==="
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
-SCRIPT_DIR=$(cd $(dirname $0) && pwd)
+echo "=== Installation automatique de N.A.P.T ==="
 
-# 1. System dependencies
-echo "[1/6] Installing system dependencies..."
+echo "[0/5] Outils systeme (nmap, curl, python3)..."
 sudo apt-get update -qq
-sudo apt-get install -y python3 python3-venv python3-pip nmap wget curl git 2>/dev/null || true
-if ! command -v node &>/dev/null; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - 2>/dev/null
-  sudo apt-get install -y nodejs 2>/dev/null || true
+sudo apt-get install -y -qq python3 python3-venv python3-pip nmap curl >/dev/null
+
+if ! command -v msfconsole >/dev/null 2>&1; then
+  echo "      Installation de Metasploit (quelques minutes)..."
+  curl -s https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfupdate.erb > /tmp/msfinstall
+  chmod 755 /tmp/msfinstall
+  sudo /tmp/msfinstall >/dev/null
 fi
 
-# 2. Backend
-echo "[2/6] Setting up backend..."
-cd "$SCRIPT_DIR"
+if ! command -v npm >/dev/null 2>&1; then
+  echo "      Installation de Node.js..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >/dev/null
+  sudo apt-get install -y -qq nodejs >/dev/null
+fi
+
+echo "[1/5] Environnement Python + dependances..."
 python3 -m venv venv
 source venv/bin/activate
-pip install -q -r requirements.txt
+pip install --upgrade pip -q
+pip install -r requirements.txt -q
 
-# 3. .env
-echo "[3/6] Configuring environment..."
 if [ ! -f .env ]; then
-  echo "OPENROUTER_API_KEY=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" > .env
-  echo "SECRET_KEY=napt_secret_key" >> .env
+  echo "[2/5] Creation du fichier .env..."
+  cat > .env << 'ENVEOF'
+OPENROUTER_API_KEY=METS_TA_CLE_OPENROUTER_ICI
+JWT_SECRET=napt_secret_key
+DATABASE_URL=sqlite:///./napt.db
+ENVEOF
+  echo "      -> IMPORTANT : edite .env et mets ta cle OpenRouter."
+else
+  echo "[2/5] .env deja present, conserve."
 fi
 
-# 4. Qdrant
-echo "[4/6] Installing Qdrant..."
-rm -rf /tmp/qdrant
-mkdir -p /tmp/qdrant
-wget -q https://github.com/qdrant/qdrant/releases/download/v1.9.0/qdrant-x86_64-unknown-linux-musl.tar.gz -O /tmp/qdrant.tar.gz
-tar -xzf /tmp/qdrant.tar.gz -C /tmp/qdrant
-pkill qdrant 2>/dev/null || true
-sleep 1
-/tmp/qdrant/qdrant --disable-telemetry > /tmp/qdrant.log 2>&1 &
-sleep 6
+echo "[3/5] Construction de l'index RAG (telecharge le modele, patienter)..."
+( cd rag && python indexer.py )
 
-# 5. Index CVEs
-echo "[5/6] Indexing CVE database..."
-cd "$SCRIPT_DIR"
-"$SCRIPT_DIR/venv/bin/python3" index_cves.py
-
-# 6. Frontend
-echo "[6/6] Setting up frontend..."
-if [ ! -d "$SCRIPT_DIR/../napt_frontend" ]; then
-  git clone https://github.com/Nawresbouali/napt-frontend.git "$SCRIPT_DIR/../napt_frontend"
-fi
-cd "$SCRIPT_DIR/../napt_frontend"
-npm install --silent
-npm run build
+echo "[4/5] Dependances frontend..."
+for d in "../napt_frontend_test" "../napt-frontend" "../napt_frontend"; do
+  if [ -d "$d" ]; then ( cd "$d" && npm install ); break; fi
+done
 
 echo ""
-echo "=============================="
-echo "  Installation complete!"
-echo "  Run: bash $SCRIPT_DIR/start.sh"
-echo "=============================="
+echo "[5/5] Installation terminee !"
+echo "      1) Edite .env et mets ta cle OpenRouter"
+echo "      2) Lance la plateforme : ./start.sh"

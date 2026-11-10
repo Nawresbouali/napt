@@ -11,13 +11,21 @@ from auth import get_current_user, decode_token
 router = APIRouter(prefix="/api/scans", tags=["scans"])
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-LLM_MODEL      = "google/gemma-4-26b-a4b-it:free"
+LLM_MODEL      = "google/gemma-4-26b-a4b-it"
 try:
     from dotenv import dotenv_values as _dv
-    _env = _dv("/home/motez/napt_api/.env")
+    _env = _dv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
     OPENROUTER_KEY = _env.get("OPENROUTER_API_KEY", "").strip()
 except Exception:
     OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+
+import re as _re_valid
+def valid_target(t: str) -> bool:
+    """Valide une cible : IP, nom de domaine ou URL (reproche #5 - validation de la cible)."""
+    t = (t or "").strip()
+    t = _re_valid.sub(r'^https?://', '', t)
+    host = t.split('/')[0].split(':')[0]
+    return bool(host) and len(host) <= 253 and bool(_re_valid.match(r'^[A-Za-z0-9._-]+$', host))
 
 def log(db, event, actor, detail=None, success=True):
     db.add(AuditLog(event_type=event, actor_username=actor, detail=detail, success=success))
@@ -55,7 +63,7 @@ def llm_call(system: str, user_msg: str) -> str:
                     {"role": "user", "content": user_msg}
                 ]
             },
-            timeout=60, verify=False
+            timeout=60
         )
         result = resp.json()
         if "error" in result:
@@ -72,6 +80,10 @@ def list_scans(db: Session = Depends(get_db), user=Depends(get_current_user)):
 
 @router.post("")
 def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    # Validation de la cible AVANT tout traitement (reproche #5)
+    if not valid_target(data.target):
+        raise HTTPException(status_code=400, detail="Cible invalide : adresse IP ou nom de domaine attendu.")
+
     scan_id = str(uuid.uuid4())
     scan = Scan(id=scan_id, target=data.target, target_type=data.target_type,
                 status="running", started_by_id=user.id)
@@ -96,6 +108,7 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
             port = int(parts[1]) if len(parts) > 1 else None
 
         from database import SessionLocal
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rag"))
         db2 = SessionLocal()
 
         cve_id, severity, cvss, summary = None, "low", "0.0", ""
@@ -105,11 +118,13 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
         exploit_result = ""
 
         try:
-            # AGENT 1 : RECONNAISSANCE (Nmap)
+            # AGENT 1: RECONNAISSANCE (sortie XML fiable + fallback regex - reproche #5)
+            import xml.etree.ElementTree as ET
             emit_event(sid, "agent_start", "reconnaissance", {"label": "Reconnaissance", "target": host, "port": port})
-            nmap_cmd = ["nmap", "-sV", "--top-ports", "50", "--host-timeout", "60s", host]
+            xml_path = f"/tmp/napt_nmap_{sid}.xml"
+            nmap_cmd = ["nmap", "-sV", "--top-ports", "200", "-oX", xml_path, "--host-timeout", "90s", host]
             if port:
-                nmap_cmd = ["nmap", "-sV", "-p", str(port), "--host-timeout", "60s", host]
+                nmap_cmd = ["nmap", "-sV", "-p", str(port), "-oX", xml_path, "--host-timeout", "90s", host]
             emit_event(sid, "agent_output", "reconnaissance", output=f"[NAPT_0]$ {' '.join(nmap_cmd)}")
             proc = subprocess.Popen(nmap_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             nmap_lines = []
@@ -119,10 +134,33 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
                 emit_event(sid, "agent_output", "reconnaissance", output=line)
             proc.wait()
             full_output = "\n".join(nmap_lines)
-            for line in nmap_lines:
-                m = re.match(r"\s*(\d+)/(\w+)\s+open\s+(\S+)\s*(.*)", line)
-                if m:
-                    ports.append({"port": m.group(1), "proto": m.group(2), "service": m.group(3), "version": m.group(4).strip()})
+
+            # Parsing XML natif (fiable)
+            try:
+                tree = ET.parse(xml_path)
+                for p in tree.getroot().iter("port"):
+                    st = p.find("state")
+                    if st is not None and st.get("state") == "open":
+                        svc = p.find("service")
+                        service = svc.get("name") if svc is not None else ""
+                        version = ""
+                        if svc is not None:
+                            version = " ".join(x for x in [svc.get("product"), svc.get("version")] if x)
+                        ports.append({"port": p.get("portid"), "proto": p.get("protocol"),
+                                      "service": service, "version": version.strip()})
+            except Exception:
+                # Fallback regex si le XML n'est pas disponible
+                for line in nmap_lines:
+                    m = re.match(r"\s*(\d+)/(\w+)\s+open\s+(\S+)\s*(.*)", line)
+                    if m:
+                        ports.append({"port": m.group(1), "proto": m.group(2),
+                                      "service": m.group(3), "version": m.group(4).strip()})
+            finally:
+                try:
+                    os.remove(xml_path)
+                except Exception:
+                    pass
+
             latency = None
             for line in nmap_lines:
                 lm = re.search(r"\((\d+\.\d+s) latency\)", line)
@@ -131,114 +169,127 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
             emit_event(sid, "agent_result", "reconnaissance", {"host": host, "latency": latency, "ports": ports, "ports_count": len(ports)})
             emit_event(sid, "agent_complete", "reconnaissance")
 
-            # AGENT 2 : RAG CVE SEARCH (Qdrant)
+            # AGENT 2: RAG LOOKUP (avec seuil de confiance - reproche #3)
             emit_event(sid, "agent_start", "rag_lookup", {"label": "Recherche CVE"})
+            SIM_MIN = 0.55
             if ports:
-                emit_event(sid, "agent_output", "rag_lookup", output="+ Recherche CVE dans la base Qdrant...")
-                try:
-                    from qdrant_client import QdrantClient
-                    from fastembed import TextEmbedding
-                    qclient = QdrantClient("localhost", port=6333)
-                    embedder = TextEmbedding()
-                    services_str = " ".join([f"{p['service']} {p['version']}" for p in ports])
-                    query_vec = list(embedder.embed([services_str]))[0].tolist()
-                    results = qclient.search(collection_name="cve_collection", query_vector=query_vec, limit=3)
-                    if results:
-                        best = results[0].payload
-                        cve_id   = best.get("cve_id")
-                        cvss     = str(best.get("cvss", "0.0"))
-                        severity = best.get("severity", "low")
-                        summary  = best.get("description", "")
-                        svc_name = best.get("service", "")
-                        emit_event(sid, "agent_output", "rag_lookup", output=f"+ CVE trouvee: {cve_id} (score: {results[0].score:.2f})")
-                        emit_event(sid, "agent_result", "rag_lookup", {
-                            "cve_id": cve_id, "cvss": cvss, "severity": severity,
-                            "service": svc_name, "version": ""
-                        })
-                        emit_event(sid, "agent_output", "rag_lookup", output=f"CVE: {cve_id} CVSS:{cvss} ({severity.upper()})")
-                    else:
-                        emit_event(sid, "agent_output", "rag_lookup", output="Aucune CVE trouvee dans Qdrant")
-                except Exception as rag_err:
-                    emit_event(sid, "agent_output", "rag_lookup", output=f"Erreur RAG: {rag_err}")
+                from searcher import find_cve_for_service
+                best_score = -1
+                best_svc = None
+                best_sim = 0.0
+                for svc in ports:
+                    query_str = f"{svc['service']} {svc['version']}"
+                    emit_event(sid, "agent_output", "rag_lookup", output=f"+ rag_query: {query_str}")
+                    cves = find_cve_for_service(svc["service"], svc["version"], limit=1)
+                    if cves:
+                        c = cves[0]
+                        sim = float(c.get("score") or 0)
+                        emit_event(sid, "agent_output", "rag_lookup", output=f"  similarite {round(sim, 3)} (seuil {SIM_MIN})")
+                        if sim < SIM_MIN:
+                            continue
+                        c_cvss = float(c.get("cvss") or c.get("cvss_score") or 0)
+                        if c_cvss > best_score:
+                            best_score = c_cvss
+                            cve_id = c.get("cve_id")
+                            severity = c.get("severity", "low")
+                            cvss = str(c_cvss)
+                            summary = c.get("text", "")
+                            best_svc = svc
+                            best_sim = sim
+                if cve_id:
+                    from searcher import get_remediation
+                    reco = get_remediation(cve_id)
+                    summary = summary + " || REMEDIATION: " + reco
+                    emit_event(sid, "agent_result", "rag_lookup", {"cve_id": cve_id, "cvss": cvss, "severity": severity, "similarity": round(best_sim, 3)})
+                    emit_event(sid, "agent_output", "rag_lookup", output=f"CVE trouvee: {cve_id} (CVSS {cvss}, {severity.upper()}, sim {round(best_sim, 3)})")
+                else:
+                    emit_event(sid, "agent_output", "rag_lookup", output=f"Aucune CVE au-dessus du seuil ({SIM_MIN})")
             else:
-                emit_event(sid, "agent_output", "rag_lookup", output="Aucun port ouvert detecte")
+                emit_event(sid, "agent_output", "rag_lookup", output="Aucun port ouvert")
             emit_event(sid, "agent_complete", "rag_lookup")
 
-            # AGENT 3 : ANALYSE DE VULNERABILITES (Gemma)
+            # AGENT 3: EVALUATION CVSS PAR GEMMA (reproche #1 corrige)
             emit_event(sid, "agent_start", "vulnerability_analysis", {"label": "Analyse de vulnerabilites"})
             if cve_id:
-                emit_event(sid, "agent_output", "vulnerability_analysis", output=f"+ Gemma analyse: {cve_id} sur {host}")
-                system_prompt = (
-                    "Tu es N.A.P.T, expert en cybersecurite. Analyse la vulnerabilite et fournis: "
-                    "1) Vecteur d attaque 2) Impact potentiel 3) Niveau de risque 4) Recommandations de remediation. "
-                    "Sois concis et precis. Reponds en francais."
-                )
-                user_prompt = (
-                    f"Cible: {host}\n"
-                    f"Ports: {', '.join(p['port']+'/'+p['service'] for p in ports)}\n"
-                    f"CVE: {cve_id}\nCVSS: {cvss} ({severity.upper()})\n"
-                    f"Description: {summary[:400]}\n\nAnalyse de risque:"
-                )
-                llm_analysis = llm_call(system_prompt, user_prompt)
+                emit_event(sid, "agent_output", "vulnerability_analysis", output=f"+ Gemma evalue le CVSS de {cve_id} sur {host}...")
+                from ai_cvss import evaluate_cvss
+                _ev = evaluate_cvss(llm_call, host, ports, cve_id, summary, cvss, severity)
+                cvss = _ev["cvss"]
+                severity = _ev["severity"]
+                llm_analysis = _ev["analysis"]
                 for line in llm_analysis.split("\n"):
                     if line.strip():
                         emit_event(sid, "agent_output", "vulnerability_analysis", output=line)
-                emit_event(sid, "agent_result", "vulnerability_analysis", {
-                    "cve_id": cve_id, "cvss": cvss, "severity": severity, "analysis": llm_analysis[:500]
-                })
+                emit_event(sid, "agent_result", "vulnerability_analysis", {"cve_id": cve_id, "cvss": cvss, "severity": severity, "cvss_vector": _ev["cvss_vector"], "analysis": llm_analysis[:500]})
             else:
                 emit_event(sid, "agent_output", "vulnerability_analysis", output="Pas de CVE a analyser - hote semble securise")
-                emit_event(sid, "agent_result", "vulnerability_analysis", {
-                    "cve_id": None, "cvss": "0.0", "severity": "none", "analysis": "Aucune vulnerabilite critique."
-                })
+                emit_event(sid, "agent_result", "vulnerability_analysis", {"cve_id": None, "cvss": "0.0", "severity": "none", "analysis": "Aucune vulnerabilite critique."})
             emit_event(sid, "agent_complete", "vulnerability_analysis")
 
-            # AGENT 4 : SUGGESTION D'EXPLOITATION (Gemma)
+            # AGENT 4: EXPLOITATION (METASPLOIT - module fiable, reproche #2)
             emit_event(sid, "agent_start", "exploitation", {"label": "Exploitation"})
             if cve_id:
-                emit_event(sid, "agent_output", "exploitation", output=f"+ Gemma analyse le vecteur d exploitation pour {cve_id}...")
-                exploit_suggestion = llm_call(
-                    "Tu es N.A.P.T, expert en cybersecurite offensif. Reponds en francais.",
-                    f"CVE: {cve_id} (CVSS: {cvss}, {severity.upper()})\n"
-                    f"Cible: {host}\n"
-                    f"Services: {', '.join(p['port']+'/'+p['service'] for p in ports)}\n\n"
-                    "Donne: 1) Le module Metasploit recommande 2) La commande d exploitation 3) L impact potentiel. Sois concis."
-                )
-                for line in exploit_suggestion.split("\n"):
-                    if line.strip():
-                        emit_event(sid, "agent_output", "exploitation", output=line)
-                exploit_result = exploit_suggestion
-                emit_event(sid, "agent_result", "exploitation", {
-                    "module": f"Gemma suggestion pour {cve_id}",
-                    "target": host,
-                    "success": not exploit_suggestion.startswith("[LLM indisponible"),
-                    "output": exploit_suggestion[:300]
-                })
+                from msf_modules import get_msf_module
+                _ctx = "Services: " + ", ".join(p["service"] + " " + p["version"] for p in ports)
+                msf_module, _map_rport, _origin = get_msf_module(cve_id, llm_call, _ctx)
+                if not msf_module:
+                    emit_event(sid, "agent_output", "exploitation", output=f"Aucun module Metasploit connu pour {cve_id}")
+                    emit_event(sid, "agent_result", "exploitation", {"module": None, "target": host, "success": False, "output": "Pas de module"})
+                else:
+                    _rport = _map_rport or (ports[0]["port"] if ports else 445)
+                    emit_event(sid, "agent_output", "exploitation", output=f"+ Module ({_origin}): {msf_module}  RPORT={_rport}")
+                    msf_cmd = f"use {msf_module}; set RHOSTS {host}; set RPORT {_rport}; set VERBOSE true; run -z; exit -y"
+                    try:
+                        msf_proc = subprocess.Popen(["msfconsole", "-q", "-x", msf_cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                        msf_lines = []
+                        import select as _select, time as _time
+                        msf_deadline = _time.time() + 180
+                        while _time.time() < msf_deadline:
+                            ready, _, _ = _select.select([msf_proc.stdout], [], [], 2.0)
+                            if ready:
+                                line = msf_proc.stdout.readline()
+                                if not line:
+                                    break
+                                line = line.rstrip()
+                                msf_lines.append(line)
+                                emit_event(sid, "agent_output", "exploitation", output=line)
+                            elif msf_proc.poll() is not None:
+                                break
+                        else:
+                            msf_proc.kill()
+                            emit_event(sid, "agent_output", "exploitation", output="Timeout 180s - Metasploit arrete")
+                        try:
+                            msf_proc.stdout.close()
+                        except Exception:
+                            pass
+                        exploit_result = "\n".join(msf_lines)
+                        _low = exploit_result.lower()
+                        success = ("session" in _low and "opened" in _low) or "meterpreter" in _low
+                        emit_event(sid, "agent_result", "exploitation", {"module": msf_module, "target": host, "success": success, "output": exploit_result[:300]})
+                        emit_event(sid, "agent_output", "exploitation", output=("EXPLOITATION REUSSIE - session ouverte" if success else "Exploitation non confirmee"))
+                    except Exception as msf_err:
+                        emit_event(sid, "agent_output", "exploitation", output=f"Metasploit: {msf_err}")
+                        emit_event(sid, "agent_result", "exploitation", {"module": msf_module, "target": host, "success": False, "output": str(msf_err)})
             else:
                 emit_event(sid, "agent_output", "exploitation", output="Pas de CVE - exploitation ignoree")
                 emit_event(sid, "agent_result", "exploitation", {"module": None, "target": host, "success": False, "output": ""})
             emit_event(sid, "agent_complete", "exploitation")
 
-            # AGENT 5 : RAPPORT
+            # AGENT 5: RAPPORT
             emit_event(sid, "agent_start", "report", {"label": "Generation du rapport"})
             emit_event(sid, "agent_output", "report", output="+ Consolidation du rapport...")
             if cve_id:
                 emit_event(sid, "agent_output", "report", output=f"+ CVE: {cve_id}  CVSS: {cvss}  Severite: {severity.upper()}")
-            emit_event(sid, "agent_output", "report", output="+ Enregistrement en base PostgreSQL...")
+            emit_event(sid, "agent_output", "report", output="+ Enregistrement en base...")
             s = db2.query(Scan).filter(Scan.id == sid).first()
             if s:
-                s.status    = "completed"
+                s.status = "completed"
                 s.finished_at = datetime.utcnow()
-                s.cve_id    = cve_id
-                s.severity  = severity
+                s.cve_id = cve_id
+                s.severity = severity
                 s.cvss_score = cvss
                 s.client_summary = summary
-                s.raw_output = (
-                    full_output +
-                    "\n\n=== GEMMA CVE IDENTIFICATION ===\n" + (summary or "N/A") +
-                    "\n\n=== GEMMA ANALYSIS ===\n" + llm_analysis +
-                    "\n\n=== EXPLOIT ===\n" + exploit_result
-                )
+                s.raw_output = full_output + "\n\n=== LLM ANALYSIS ===\n" + llm_analysis + "\n\n=== EXPLOIT ===\n" + exploit_result
                 db2.commit()
             emit_event(sid, "agent_output", "report", output="Rapport enregistre avec succes")
             emit_event(sid, "agent_complete", "report")
@@ -288,7 +339,7 @@ def scan_network(user=Depends(get_current_user)):
 @router.get("/nmap-target")
 def scan_target(host: str, user=Depends(get_current_user)):
     import subprocess, re
-    if not re.match(r'^[\w\.\-]+$', host):
+    if not valid_target(host):
         raise HTTPException(status_code=400, detail="Cible invalide")
     try:
         result = subprocess.run(["nmap", "-sV", "--top-ports", "100", "--host-timeout", "30s", host], capture_output=True, text=True, timeout=120)
@@ -335,13 +386,11 @@ def chat(scan_id: str, data: ChatRequest, db: Session = Depends(get_db), user=De
 
 def generate_reply(question: str, scan) -> str:
     try:
-        return llm_call(
-            "Tu es N.A.P.T, expert en cybersecurite. Reponds en francais de facon concise.",
-            f"Contexte du scan - Cible: {scan.target}, CVE: {scan.cve_id or 'inconnue'}, "
-            f"Severite: {scan.severity or 'N/A'}.\nQuestion: {question}"
-        )
+        payload = {"model": "mistral", "prompt": f"Tu es un expert en securite. Scan: {scan.target}, CVE: {scan.cve_id}.\nQuestion: {question}", "stream": False}
+        r = req.post("http://localhost:11434/api/generate", json=payload, timeout=30)
+        return r.json().get("response", "")
     except Exception:
-        return f"Concernant {scan.cve_id or 'cette vulnerabilite'} sur {scan.target}: Appliquer les patches de securite."
+        return f"Concernant {scan.cve_id or 'cette vulnerabilite'} sur {scan.target}: Appliquer les patches de securite et verifier les configurations systeme."
 
 @router.websocket("/{scan_id}/live")
 async def ws_live(websocket: WebSocket, scan_id: str):

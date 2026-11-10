@@ -24,11 +24,8 @@ def rag_search_endpoint(data: RAGQuery, _=Depends(get_current_user)):
 @router.get("/stats")
 def rag_stats(_=Depends(get_current_user)):
     try:
-        import requests
-        r = requests.get("http://localhost:6333/collections/cve_collection", timeout=5)
-        data = r.json()
-        count = data.get("result", {}).get("points_count", 0)
-        return {"status": "ok", "collection": "cve_collection", "vectors_count": count, "points_count": count, "dimension": 384, "distance": "Cosine", "model": "BAAI/bge-small-en-v1.5"}
+        from store import collection_stats
+        return collection_stats()
     except Exception as e:
         raise HTTPException(500, f"Stats error: {e}")
 

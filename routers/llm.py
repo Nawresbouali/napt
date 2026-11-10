@@ -6,8 +6,8 @@ from auth import get_current_user
 router = APIRouter(prefix="/api/llm", tags=["llm"])
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "meta-llama/llama-3.1-8b-instruct:free"
-API_KEY = os.getenv("OPENROUTER_API_KEY", "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").strip()
+MODEL = "google/gemma-4-26b-a4b-it:free"
+API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
@@ -21,7 +21,7 @@ class LLMRequest(BaseModel):
     cve_id: str = ""
 
 async def call_gemma(system: str, user_msg: str) -> str:
-    async with httpx.AsyncClient(timeout=60, verify=False) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(OPENROUTER_URL, headers=HEADERS, json={
             "model": MODEL,
             "messages": [
