@@ -171,7 +171,7 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
 
             # AGENT 2: RAG LOOKUP (avec seuil de confiance - reproche #3)
             emit_event(sid, "agent_start", "rag_lookup", {"label": "Recherche CVE"})
-            SIM_MIN = 0.55
+            SIM_MIN = 0.70
             if ports:
                 from searcher import find_cve_for_service
                 best_score = -1
