@@ -396,15 +396,16 @@ def stop_scan(scan_id: str, db: Session = Depends(get_db), user=Depends(get_curr
 
 @router.get("/nmap-network")
 def scan_network(user=Depends(get_current_user)):
+    # NAPT_NET_FIX : plage Docker + decouverte TCP (le ping est bloque par les conteneurs)
     import subprocess, re
     try:
-        result = subprocess.run(["nmap", "-sn", "172.22.64.0/20", "--host-timeout", "10s"], capture_output=True, text=True, timeout=60)
+        result = subprocess.run(["nmap", "-sn", "-PS21,22,80,139,445,3306,6667", "172.17.0.0/24", "--host-timeout", "8s"], capture_output=True, text=True, timeout=90)
         hosts = []
         for line in result.stdout.splitlines():
             ip_match = re.search(r"Nmap scan report for (.+)", line)
             if ip_match:
                 hosts.append({"host": ip_match.group(1), "status": "up"})
-        return {"network": "172.22.64.0/20", "hosts_found": len(hosts), "hosts": hosts, "raw": result.stdout}
+        return {"network": "172.17.0.0/24", "hosts_found": len(hosts), "hosts": hosts, "raw": result.stdout}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -414,7 +415,7 @@ def scan_target(host: str, user=Depends(get_current_user)):
     if not valid_target(host):
         raise HTTPException(status_code=400, detail="Cible invalide")
     try:
-        result = subprocess.run(["nmap", "-sV", "--top-ports", "100", "--host-timeout", "30s", host], capture_output=True, text=True, timeout=120)
+        result = subprocess.run(["nmap", "-sV", "-Pn", "--top-ports", "100", "--host-timeout", "30s", host], capture_output=True, text=True, timeout=120)
         ports = []
         for line in result.stdout.splitlines():
             m = re.match(r'\s*(\d+/\w+)\s+(\w+)\s+(\S+)\s*(.*)', line)
