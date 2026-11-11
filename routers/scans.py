@@ -126,9 +126,10 @@ def launch_scan(data: LaunchScanRequest, db: Session = Depends(get_db), user=Dep
             import xml.etree.ElementTree as ET
             emit_event(sid, "agent_start", "reconnaissance", {"label": "Reconnaissance", "target": host, "port": port})
             xml_path = f"/tmp/napt_nmap_{sid}.xml"
-            nmap_cmd = ["nmap", "-sV", "-p", "21,22,23,25,53,80,110,111,135,139,143,443,445,512,513,514,993,995,1099,1433,1521,1524,2049,2121,3306,3389,3632,5432,5900,6000,6379,6667,6697,6699,8009,8080,8180,8443,8787", "-oX", xml_path, "--host-timeout", "180s", host]
+            # NAPT_PN_FIX : -Pn ignore le ping (cibles Docker/pare-feu qui bloquent le ping)
+            nmap_cmd = ["nmap", "-sV", "-Pn", "-p", "21,22,23,25,53,80,110,111,135,139,143,443,445,512,513,514,993,995,1099,1433,1521,1524,2049,2121,3306,3389,3632,5432,5900,6000,6379,6667,6697,6699,8009,8080,8180,8443,8787", "-oX", xml_path, "--host-timeout", "180s", host]
             if port:
-                nmap_cmd = ["nmap", "-sV", "-p", str(port), "-oX", xml_path, "--host-timeout", "90s", host]
+                nmap_cmd = ["nmap", "-sV", "-Pn", "-p", str(port), "-oX", xml_path, "--host-timeout", "90s", host]
             emit_event(sid, "agent_output", "reconnaissance", output=f"[NAPT_0]$ {' '.join(nmap_cmd)}")
             proc = subprocess.Popen(nmap_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             nmap_lines = []
